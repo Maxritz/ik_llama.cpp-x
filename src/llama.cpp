@@ -34,6 +34,7 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-expert-cache.h"
 
 #include <cmath>
 
@@ -8851,6 +8852,10 @@ struct llama_context_params llama_context_default_params() {
         /*.only_active_experts         =*/ false,
         /*.prefetch_experts            =*/ false,
         /*.prefetch_experts_threads    =*/ 0,
+        /*.expert_cache                =*/ false,
+        /*.expert_cache_slots          =*/ 0,
+        /*.expert_cache_per_layer      =*/ 1,
+        /*.perfprofile                 =*/ false,
         /*.k_cache_hadamard            =*/ false,
         /*.v_cache_hadamard            =*/ false,
         /*.split_mode_graph_scheduling =*/ false,
@@ -9361,6 +9366,10 @@ struct llama_context * llama_init_from_model(
         LLAMA_LOG_WARN("%s: --dsa is not active under -sm graph/attn (tensor-parallel attention has no indexer); running dense MLA\n", __func__);
     }
     cparams.prefetch_experts = params.prefetch_experts;
+    cparams.expert_cache = params.expert_cache;
+    cparams.expert_cache_slots = params.expert_cache_slots;
+    cparams.expert_cache_per_layer = params.expert_cache_per_layer;
+    cparams.perfprofile = params.perfprofile;
     cparams.k_cache_hadamard = params.k_cache_hadamard;
     cparams.v_cache_hadamard = params.v_cache_hadamard;
     // Folding H into wv_b/wk_b_pp permanently mutates the model; a later context
@@ -9960,9 +9969,109 @@ struct llama_context * llama_init_from_model(
         }
     }
 
-    if (params.only_active_experts) {
+    if (params.only_active_experts || params.expert_cache) {
         LLAMA_LOG_INFO("%s: enabling only_active_experts scheduling\n", __func__);
         ggml_backend_sched_set_only_active_experts(ctx->sched, true);
+    }
+    if (params.expert_cache) {
+        LLAMA_LOG_INFO("%s: enabling VRAM expert cache for >VRAM MoE inference\n", __func__);
+        /* Persistent VRAM arena for hot experts. Cache owns the arena; the MoE
+         * kernel reads experts directly from it. See ggml-expert-cache.h. */
+        if (model->hparams.n_expert > 0 && model->hparams.n_layer > 0) {
+            const int64_t n_layers = model->hparams.n_layer;
+            const int64_t n_expert = model->hparams.n_expert;
+
+            /* Per-layer expert strides (models are NOT uniform: weight shapes can
+             * vary by layer). Parse the layer index out of each MoE weight name. */
+            std::vector<int64_t> up_l(n_layers, 0), gate_l(n_layers, 0), down_l(n_layers, 0);
+            auto layer_of = [](const std::string & nm) -> int64_t {
+                auto p = nm.find("blk.");
+                size_t d = 4;
+                if (p == std::string::npos) { p = nm.find("layers."); d = 7; }
+                if (p == std::string::npos) return -1;
+                return strtoll(nm.c_str() + p + d, nullptr, 10);
+            };
+            for (const auto & [tname, tp] : model->tensors_by_name) {
+                if (!tp || tp->ne[2] <= 1) continue;
+                const int64_t l = layer_of(tname);
+                if (l < 0 || l >= n_layers) continue;
+                if (tname.find("ffn_up_exps.weight")   != std::string::npos) up_l[l]   = tp->nb[2];
+                if (tname.find("ffn_gate_exps.weight") != std::string::npos) gate_l[l] = tp->nb[2];
+                if (tname.find("ffn_down_exps.weight") != std::string::npos) down_l[l] = tp->nb[2];
+            }
+
+            ggml_backend_t gpu_backend = nullptr;
+            for (auto * be : ctx->backends) {
+                if (be != ctx->backend_cpu) { gpu_backend = be; break; }
+            }
+            if (!gpu_backend) gpu_backend = ctx->backend_cpu;
+
+            if (gpu_backend != ctx->backend_cpu) {
+                size_t free_vram = 0, total_vram = 0;
+#if defined(GGML_USE_CUDA)
+                ggml_backend_cuda_get_device_memory(0, &free_vram, &total_vram);
+#elif defined(GGML_USE_VULKAN)
+                ggml_backend_vk_get_device_memory(0, &free_vram, &total_vram);
+#endif
+                const size_t budget = params.expert_cache_slots > 0
+                    ? (size_t)params.expert_cache_slots
+                    : (size_t)(free_vram * 0.5);
+
+                /* Keep the leading run of layers that fit. */
+                int32_t n_cache_layers = 0;
+                size_t acc = 0;
+                for (int64_t l = 0; l < n_layers; ++l) {
+                    const size_t lb = (size_t)ggml_expert_cache_layer_bytes(
+                        n_expert, up_l[l], gate_l[l], down_l[l]);
+                    if (lb == 0) { n_cache_layers = (int32_t)l + 1; continue; }  /* dense layer */
+                    if (acc + lb > budget) break;
+                    acc += lb;
+                    n_cache_layers = (int32_t)l + 1;
+                }
+
+                if (n_cache_layers > 0 && acc > 0) {
+                    ggml_backend_buffer_t ecache_buffer =
+                        ggml_backend_alloc_buffer(gpu_backend, acc);
+                    if (ecache_buffer) {
+                        void * vram_base = ggml_backend_buffer_get_base(ecache_buffer);
+                        struct ggml_expert_cache * ecache =
+                            (struct ggml_expert_cache *)calloc(1, sizeof(struct ggml_expert_cache));
+                        if (ecache) {
+                            int rc = ggml_expert_cache_open(ecache, vram_base,
+                                    ggml_backend_buffer_get_size(ecache_buffer),
+                                    n_cache_layers, n_expert,
+                                    up_l.data(), gate_l.data(), down_l.data());
+                            if (rc == 0) {
+                                LLAMA_LOG_INFO("%s: expert cache: %d layers, %.2f GiB arena, %lld experts\n",
+                                    __func__, ecache->n_layers,
+                                    (double)ecache->size / 1073741824.0, (long long)n_expert);
+                                ggml_backend_sched_set_expert_cache(ctx->sched, ecache);
+                                ctx->expert_cache = ecache;
+                                ctx->expert_cache_buffer = ecache_buffer;
+
+                                /* Copy-only H2D upload calibration: roofline floor for
+                                 * expert streaming (pageable vs pinned vs d2d). Writes
+                                 * scratch at arena offset 0; no resident marks, so
+                                 * real copies overwrite safely. */
+#if defined(GGML_USE_CUDA)
+                                ggml_backend_cuda_xca_calibrate(vram_base, (size_t)up_l[0]);
+#endif
+                            } else {
+                                LLAMA_LOG_WARN("%s: expert cache open failed\n", __func__);
+                                ggml_backend_buffer_free(ecache_buffer);
+                                free(ecache);
+                            }
+                        } else {
+                            ggml_backend_buffer_free(ecache_buffer);
+                        }
+                    } else {
+                        LLAMA_LOG_WARN("%s: VRAM allocation for expert cache failed\n", __func__);
+                    }
+                } else {
+                    LLAMA_LOG_WARN("%s: expert cache: no free VRAM for a single layer arena\n", __func__);
+                }
+            }
+        }
     }
     if (params.prefetch_experts) {
         LLAMA_LOG_INFO("%s: enabling MoE expert read-ahead (prefetch_experts), %s\n", __func__,
@@ -10011,6 +10120,8 @@ struct llama_context * llama_init_from_model(
             }
         }
     }
+
+    ggml_perf_trace_set(ctx->cparams.perfprofile ? 1 : 0);
 
     return ctx;
 }

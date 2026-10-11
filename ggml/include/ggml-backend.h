@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml.h"
+#include "ggml-expert-cache.h"
 #include "ggml-alloc.h"
 
 #ifdef  __cplusplus
@@ -183,6 +184,14 @@ extern "C" {
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
 
+    // per-component device/host profile table (--perfprofile); flushed by ggml_backend_sched_free
+    GGML_API void                 ggml_perf_trace_set(int enable);
+    GGML_API int                  ggml_perf_trace_enabled(void);
+    GGML_API void                 ggml_perf_trace_add(const char * component, double dev_us, double idle_us, double host_us);
+    GGML_API void                 ggml_perf_trace_add_wall(double wall_us);
+    GGML_API void                 ggml_perf_trace_phase(const char * name, double us);
+    GGML_API void                 ggml_perf_trace_flush(void);
+
     // Initialize backend buffers from a measure graph
     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph);
 
@@ -216,6 +225,10 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_only_active_experts(ggml_backend_sched_t sched, bool on_or_off);
     GGML_API void                 ggml_backend_sched_set_split_mode_graph(ggml_backend_sched_t sched, bool on_or_off, bool async);
     GGML_API void                 ggml_backend_sched_set_max_extra_alloc(ggml_backend_sched_t sched, int extra_alloc_MiB);
+
+    // set the VRAM expert cache (hot-expert loading for >VRAM models)
+    // The cache must remain valid for the lifetime of the scheduler.
+    GGML_API void                 ggml_backend_sched_set_expert_cache(ggml_backend_sched_t sched, struct ggml_expert_cache * cache);
 
     // prefetch mmap'd MoE expert weights into the page cache
     GGML_API bool                 ggml_backend_prefetch_init(int n_threads);

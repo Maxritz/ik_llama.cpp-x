@@ -48,7 +48,7 @@ struct llama_cparams {
     bool swa_compress = false;
     bool dsv4_legacy_state = false;   // write DeepSeek-V4 state in the legacy full-slice layout (no MAGIC)
     int  dsa_top_k = -1;              // DSA top-k override (<0 => use the model's configured indexer_top_k)
-    bool split_mode_graph_scheduling;
+     bool split_mode_graph_scheduling;
     //bool split_mode_f16;
     bool scheduler_async;
     int  min_experts;
@@ -56,6 +56,11 @@ struct llama_cparams {
     bool mtp;
     int  worst_graph_tokens;
     int  dflash_query_capacity = 0; // internal DFlash query capacity override
+
+    bool expert_cache = false;     // enable VRAM expert cache for >VRAM MoE models (Phase A: Strata ExpertCache port)
+    int  expert_cache_slots = 0;   // number of VRAM slots for expert cache (0 = auto from VRAM budget)
+    int  expert_cache_per_layer = 1; // 1 = per-layer slot ranges (R4.2g), 0 = global
+    bool perfprofile = false;      // print per-component device/host profile table at teardown
 
     enum ggml_type reduce_type;
     enum ggml_type graph_attn_precision;

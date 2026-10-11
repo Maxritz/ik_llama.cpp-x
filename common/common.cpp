@@ -2433,6 +2433,25 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.prefetch_experts_threads = std::stoi(argv[i]);
         return true;
     }
+    if (arg == "-xca" || arg == "--expert-cache") {
+        params.expert_cache = true;
+        return true;
+    }
+    if (arg == "-xca-slots" || arg == "--expert-cache-slots") {
+        CHECK_ARG;
+        params.expert_cache = true;
+        params.expert_cache_slots = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "-xca-global" || arg == "--expert-cache-global") {
+        params.expert_cache = true;
+        params.expert_cache_per_layer = 0;
+        return true;
+    }
+    if (arg == "--perfprofile") {
+        params.perfprofile = true;
+        return true;
+    }
     if (arg == "--fit-margin") {
         CHECK_ARG;
         int32_t margin = std::stoi(argv[i]);
@@ -3568,6 +3587,12 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-prexp, --prefetch-experts",     "stream mmap'd MoE expert weights into the page cache on Linux"});
     options.push_back({ "*",           "-prexp-t, --prefetch-experts-threads N",
                                                                         "number of expert prefetch workers, tune to drive speed/type (default: auto)"});
+    options.push_back({ "*",           "-xca,  --expert-cache",           "keep hot MoE experts resident in a VRAM slot pool (>VRAM MoE); implies only_active_experts"});
+    options.push_back({ "*",           "-xca-slots, --expert-cache-slots N",
+                                                                        "number of VRAM expert slots for --expert-cache (default: auto from free VRAM)"});
+    options.push_back({ "*",           "-xca-global, --expert-cache-global",
+                                                                        "use one global expert slot pool instead of per-layer ranges"});
+    options.push_back({ "*",           "       --perfprofile",          "print per-component GPU/host profile table (component, ops, %dev, dev_ms, idle_ms, host_ms) at exit"});
     options.push_back({ "*",           "       --cpu-affinity",          "pin CPU workers to the physical P-cores (hybrid CPUs only)"});
     options.push_back({ "*",           "-cm,   --cpu-mask MASK",         "pin CPU workers to the logical CPUs set in MASK (hex or decimal bitmask, e.g. 0x55; 64 CPUs max, use --cpu-range for more)"});
     options.push_back({ "*",           "-cr,   --cpu-range LIST",        "pin CPU workers to the given logical CPUs (e.g. 0-3,8,10-11)"});
@@ -4717,6 +4742,10 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.only_active_experts = params.only_active_exps;
     cparams.prefetch_experts  = params.prefetch_experts;
     cparams.prefetch_experts_threads = params.prefetch_experts_threads;
+    cparams.expert_cache      = params.expert_cache;
+    cparams.expert_cache_slots = params.expert_cache_slots;
+    cparams.expert_cache_per_layer = params.expert_cache_per_layer;
+    cparams.perfprofile       = params.perfprofile;
     cparams.max_extra_alloc   = params.max_extra_alloc_MiB;
     cparams.mtp               = params.has_mtp || params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
     cparams.mtp_op_type      = MTP_OP_NONE;

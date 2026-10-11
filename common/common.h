@@ -482,6 +482,10 @@ struct gpt_params {
     bool defer_ple         = false; // if true, keep the per-layer token embedding on the file (Linux and Windows only)
     bool prefetch_experts  = false; // if true, stream mmap'd MoE expert weights into the page cache (Linux only)
     int  prefetch_experts_threads = 0; // number of expert prefetch workers (<=0 = auto)
+    bool expert_cache        = false; // if true, keep hot experts resident in a VRAM slot pool (>VRAM MoE)
+    int  expert_cache_slots   = 0;     // number of VRAM expert slots (0 = auto from free VRAM)
+    int  expert_cache_per_layer = 1;   // 1 = per-layer slot ranges, 0 = global pool
+    bool perfprofile          = false; // print per-component device/host profile table at teardown
     bool k_cache_hadamard  = false; // if true, use Hadamard transform for the K-cache (only makes sense with quantized cache)
     bool v_cache_hadamard  = false; // if true, use Hadamard transform for the V-cache (only makes sense with quantized cache, which requires FA)
     bool split_mode_graph_scheduling = false; // if true, force split mode graph scheduling

@@ -511,6 +511,11 @@ extern "C" {
         bool only_active_experts;
         bool prefetch_experts;  // if true, stream mmap'd MoE expert weights into the page cache (Linux only)
         int  prefetch_experts_threads; // number of expert prefetch workers (<=0 = auto)
+
+        bool expert_cache;        // enable VRAM expert cache for >VRAM MoE models
+        int  expert_cache_slots;     // number of VRAM slots for expert cache (0 = auto)
+        int  expert_cache_per_layer; // 1 = per-layer slot ranges, 0 = global
+        bool perfprofile;         // print per-component device/host profile table at teardown
         bool k_cache_hadamard;  // if true, apply Hadamard transform to K-cache
         bool v_cache_hadamard;  // if true, apply Hadamard transform to V-cache (needs FA)
         bool split_mode_graph_scheduling; // if true, force split mode graph scheduling

@@ -68,7 +68,9 @@ add_library(${TARGET} STATIC
     llguidance.cpp
     json-schema-to-grammar.cpp
     train.h
-    train.cpp
+    # train.cpp causes duplicate llama_file symbol with llama-mmap.cpp on HIP/Windows
+    # Uncomment to enable training (requires fixing the duplicate symbol or using GCC/Clang):
+    # train.cpp
     log.cpp
     log.h    
     http.h

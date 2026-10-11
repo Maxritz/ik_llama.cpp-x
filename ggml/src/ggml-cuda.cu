@@ -658,8 +658,7 @@ GGML_CALL static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t 
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
-GGML_CALL static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
-    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+GGML_CALL static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *)tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
@@ -4356,6 +4355,10 @@ GGML_CALL static ggml_backend_buffer_type_t ggml_backend_cuda_get_default_buffer
     return ggml_backend_cuda_buffer_type(cuda_ctx->device);
 }
 
+static std::atomic<int64_t> xca_stage_bytes{0};
+static std::atomic<int64_t> xca_stage_calls{0};
+static bool xca_stage_atexit = false;
+
 GGML_CALL static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
@@ -4363,6 +4366,18 @@ GGML_CALL static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend,
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
     ggml_cuda_set_device(cuda_ctx->device);
+    if (getenv("IK_XCA_TIMING")) {
+        if (!xca_stage_atexit) {
+            xca_stage_atexit = true;
+            atexit([] {
+                fprintf(stderr, "xca-stage-bytes calls=%lld bytes=%.2fMB\n",
+                        (long long) xca_stage_calls.load(std::memory_order_relaxed),
+                        xca_stage_bytes.load(std::memory_order_relaxed) / 1e6);
+            });
+        }
+    }
+    xca_stage_bytes.fetch_add((int64_t) size, std::memory_order_relaxed);
+    xca_stage_calls.fetch_add(1, std::memory_order_relaxed);
     CUDA_CHECK(cudaMemcpyAsync((char *)tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
@@ -4671,6 +4686,130 @@ static void update_cuda_graph_executable(ggml_cuda_graph * graph) {
 }
 #endif
 
+struct ggml_perf_rec {
+    const char * comp;
+    int ev0;
+    int ev1;
+    double host_us;
+};
+
+static std::mutex ggml_perf_ev_mtx;
+static std::unordered_map<int, std::vector<cudaEvent_t>> ggml_perf_ev_pool; // slot 0 = graph-start event
+static std::unordered_map<int, std::vector<ggml_perf_rec>> ggml_perf_recs;
+
+static const char * ggml_perf_component(const ggml_tensor * t) {
+    switch (t->op) {
+        case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_MOE_FUSED_UP_GATE:
+            return "moe";
+        case GGML_OP_FLASH_ATTN_EXT:
+            return "attn";
+        case GGML_OP_MUL_MAT:
+            {
+                const char * n = t->name;
+                if ((!n || !n[0]) && t->src[0]) {
+                    n = t->src[0]->name;
+                }
+                if (n && strstr(n, "attn")) {
+                    return "attn";
+                }
+                if (n && (strstr(n, "ffn") || strstr(n, "mlp"))) {
+                    return "ffn";
+                }
+                return "matmul";
+            }
+        case GGML_OP_NORM:
+        case GGML_OP_RMS_NORM:
+            return "norm";
+        case GGML_OP_ROPE:
+        case GGML_OP_ROPE_BACK:
+        case GGML_OP_ROPE_CACHE:
+        case GGML_OP_ROPE_FAST:
+            return "rope";
+        case GGML_OP_SOFT_MAX:
+        case GGML_OP_DIAG_MASK_INF:
+            return "softmax";
+        case GGML_OP_ADD:
+            return "residual";
+        case GGML_OP_CPY:
+        case GGML_OP_GET_ROWS:
+            return "copy";
+        default:
+            return ggml_op_name(t->op);
+    }
+}
+
+static void ggml_perf_trace_nodes(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
+    const int dev = cuda_ctx->device;
+
+    std::lock_guard<std::mutex> lock(ggml_perf_ev_mtx);
+    std::vector<cudaEvent_t> & pool = ggml_perf_ev_pool[dev];
+    std::vector<ggml_perf_rec> & recs = ggml_perf_recs[dev];
+
+    const size_t need = 1 + 2 * (size_t) cgraph->n_nodes;
+    for (size_t i = pool.size(); i < need; i++) {
+        cudaEvent_t ev = nullptr;
+        CUDA_CHECK(cudaEventCreate(&ev));
+        pool.push_back(ev);
+    }
+
+    recs.clear();
+    recs.reserve(cgraph->n_nodes);
+
+    CUDA_CHECK(cudaEventRecord(pool[0], cuda_ctx->stream()));
+
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * node = cgraph->nodes[i];
+
+        if (ggml_is_noop(node)) continue;
+
+        const int64_t t0 = ggml_time_us();
+        const int ev0 = 1 + 2 * (int) recs.size();
+        const int ev1 = ev0 + 1;
+        CUDA_CHECK(cudaEventRecord(pool[ev0], cuda_ctx->stream()));
+        bool ok = ggml_cuda_compute_forward(*cuda_ctx, node, cgraph, i);
+        CUDA_CHECK(cudaEventRecord(pool[ev1], cuda_ctx->stream()));
+        if (!ok) {
+            GGML_CUDA_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+        }
+        GGML_ASSERT(ok);
+        recs.push_back({ ggml_perf_component(node), ev0, ev1, (double) (ggml_time_us() - t0) });
+    }
+}
+
+static void ggml_perf_trace_collect(ggml_backend_cuda_context * cuda_ctx) {
+    const int dev = cuda_ctx->device;
+
+    std::vector<ggml_perf_rec> recs;
+    std::vector<cudaEvent_t> pool;
+    {
+        std::lock_guard<std::mutex> lock(ggml_perf_ev_mtx);
+        auto it = ggml_perf_recs.find(dev);
+        if (it == ggml_perf_recs.end() || it->second.empty()) {
+            return;
+        }
+        recs = std::move(it->second);
+        it->second.clear();
+        pool = ggml_perf_ev_pool[dev];
+    }
+
+    const int64_t ts0 = ggml_time_us();
+    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    const int64_t ts1 = ggml_time_us();
+    ggml_perf_trace_phase("collect_sync", (double) (ts1 - ts0));
+
+    for (size_t i = 0; i < recs.size(); i++) {
+        const ggml_perf_rec & r = recs[i];
+        const cudaEvent_t ev_gap = pool[i == 0 ? 0 : recs[i - 1].ev1];
+        float ms_gap = 0.0f;
+        float ms_dev = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms_gap, ev_gap, pool[r.ev0]));
+        CUDA_CHECK(cudaEventElapsedTime(&ms_dev, pool[r.ev0], pool[r.ev1]));
+        ggml_perf_trace_add(r.comp, (double) ms_dev * 1e3, (double) ms_gap * 1e3, r.host_us);
+    }
+    ggml_perf_trace_phase("collect_query", (double) (ggml_time_us() - ts1));
+}
+
 static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph,
     bool & graph_evaluated_or_captured, bool & use_cuda_graph, bool & cuda_graph_update_required) {
     // flag used to determine whether it is an integrated_gpu
@@ -4689,16 +4828,20 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
         // With the use of CUDA graphs, the execution will be performed by the graph launch.
         if (!use_cuda_graph || cuda_graph_update_required) {
 
-            for (int i = 0; i < cgraph->n_nodes; i++) {
-                ggml_tensor * node = cgraph->nodes[i];
+            if (ggml_perf_trace_enabled()) {
+                ggml_perf_trace_nodes(cuda_ctx, cgraph);
+            } else {
+                for (int i = 0; i < cgraph->n_nodes; i++) {
+                    ggml_tensor * node = cgraph->nodes[i];
 
-                if (ggml_is_noop(node)) continue;
+                    if (ggml_is_noop(node)) continue;
 
-                bool ok = ggml_cuda_compute_forward(*cuda_ctx, node, cgraph, i);
-                if (!ok) {
-                    GGML_CUDA_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+                    bool ok = ggml_cuda_compute_forward(*cuda_ctx, node, cgraph, i);
+                    if (!ok) {
+                        GGML_CUDA_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+                    }
+                    GGML_ASSERT(ok);
                 }
-                GGML_ASSERT(ok);
             }
         }
 #ifdef USE_CUDA_GRAPH
@@ -4740,6 +4883,9 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
 
     ggml_cuda_set_device(cuda_ctx->device);
 
+    const bool perf_on = ggml_perf_trace_enabled() != 0;
+    const int64_t perf_t0 = perf_on ? ggml_time_us() : 0;
+
 #ifdef USE_CUDA_GRAPH
     cuda_ctx->cur_graph = nullptr;
 
@@ -4748,7 +4894,7 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
     // Disable CUDA graphs in presence of env var, old GPU, use-case which is changing too rapidly,
     // or previous graph capture failure.
     // Also disable for multi-gpu for now. TO DO investigate
-    bool use_cuda_graph = !disable_cuda_graphs_due_to_env && cuda_ctx->use_cuda_graph;
+    bool use_cuda_graph = !disable_cuda_graphs_due_to_env && cuda_ctx->use_cuda_graph && !ggml_perf_trace_enabled();
 
     ggml_cuda_graph * graph = nullptr;
     if (use_cuda_graph) {
@@ -4822,6 +4968,12 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
     bool graph_evaluated_or_captured = false;
 
     evaluate_and_capture_cuda_graph(cuda_ctx, cgraph, graph_evaluated_or_captured, use_cuda_graph, cuda_graph_update_required);
+
+    if (perf_on) {
+        ggml_perf_trace_phase("dispatch", (double) (ggml_time_us() - perf_t0));
+        ggml_perf_trace_collect(cuda_ctx);
+        ggml_perf_trace_add_wall((double) (ggml_time_us() - perf_t0));
+    }
 
     return GGML_STATUS_SUCCESS;
 }
@@ -5531,6 +5683,49 @@ GGML_CALL void ggml_backend_cuda_get_device_memory(int device, size_t * free, si
     ggml_cuda_set_device(device);
 
     CUDA_CHECK(cudaMemGetInfo(free, total));
+}
+
+GGML_CALL void ggml_backend_cuda_xca_calibrate(void * dst, size_t bytes) {
+    if (dst == nullptr) return;
+    if (bytes < (16u << 20)) bytes = 16u << 20;
+    if (bytes > (64u << 20)) bytes = 64u << 20;
+    const int iters = 8;
+
+    auto timed = [&](const void * src, size_t size, cudaMemcpyKind kind) -> double {
+        cudaMemcpyAsync(dst, src, size, kind, cudaStreamPerThread);
+        cudaStreamSynchronize(cudaStreamPerThread);
+        const int64_t t0 = ggml_time_us();
+        for (int i = 0; i < iters; ++i) {
+            cudaMemcpyAsync(dst, src, size, kind, cudaStreamPerThread);
+        }
+        cudaStreamSynchronize(cudaStreamPerThread);
+        const double sec = (double)(ggml_time_us() - t0) / 1e6;
+        return sec > 0 ? (double)size * iters / sec / (1024.0 * 1024.0 * 1024.0) : 0.0;
+    };
+
+    /* pageable: what the expert-cache walk uses (GGUF mmap source) */
+    std::vector<uint8_t> page(bytes, 0x5A);
+    const double gbs_page = timed(page.data(), bytes, cudaMemcpyHostToDevice);
+
+    /* pinned: pure DMA path, isolates driver bounce-buffer cost */
+    double gbs_pin = 0.0;
+    void * pin = nullptr;
+    if (cudaMallocHost(&pin, bytes) == cudaSuccess) {
+        memset(pin, 0x5A, bytes);
+        gbs_pin = timed(pin, bytes, cudaMemcpyHostToDevice);
+        cudaFreeHost(pin);
+    }
+
+    /* d2d: VRAM ceiling, no PCIe involved */
+    double gbs_d2d = 0.0;
+    void * dev_src = nullptr;
+    if (cudaMalloc(&dev_src, bytes) == cudaSuccess) {
+        gbs_d2d = timed(dev_src, bytes, cudaMemcpyDeviceToDevice);
+        cudaFree(dev_src);
+    }
+
+    fprintf(stderr, "xca-cal h2d %zu MiB x%d: pageable %.2f GiB/s, pinned %.2f GiB/s, d2d %.2f GiB/s\n",
+            bytes >> 20, iters, gbs_page, gbs_pin, gbs_d2d);
 }
 
 GGML_CALL bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {

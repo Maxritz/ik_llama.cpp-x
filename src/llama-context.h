@@ -397,6 +397,10 @@ struct llama_context {
     size_t  embd_size = 0; // capacity (of floats) for embeddings
     float * embd      = nullptr;
 
+    // Phase A: VRAM experiment for >VRAM MoE models (Strata ExpertCache port)
+    struct ggml_expert_cache * expert_cache = nullptr;
+    ggml_backend_buffer_t expert_cache_buffer = nullptr;
+
     // sequence embeddings output (map of [n_embd] vectors)
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE
     std::map<llama_seq_id, std::vector<float>> embd_seq;

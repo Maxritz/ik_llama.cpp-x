@@ -3,6 +3,7 @@
 #include "ggml-impl.h"
 #include "ggml-rpc.h"
 #include "ggml-moe-prefetch.h"
+#include "ggml-expert-cache.h"
 
 #include <cassert>
 #include <climits>
@@ -14,6 +15,9 @@
 #include <vector>
 #include <set>
 #include <array>
+#include <algorithm>
+#include <map>
+#include <mutex>
 #include <chrono>
 #include <barrier>
 #include <thread>
@@ -1165,6 +1169,16 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+static ggml_backend_event_t xca_ids_event_for(ggml_backend_t backend) {
+    static std::map<ggml_backend_t, ggml_backend_event_t> xca_ids_events;
+    auto it = xca_ids_events.find(backend);
+    if (it == xca_ids_events.end()) {
+        ggml_backend_event_t ev = ggml_backend_event_new(backend);
+        it = xca_ids_events.emplace(backend, ev).first;
+    }
+    return it->second;
+}
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -1226,6 +1240,9 @@ struct ggml_backend_sched {
     bool is_async = false;
     bool debug;
     bool has_reduce = false;
+
+    // hot-expert cache for >VRAM MoE models (Strata R4.2g pattern)
+    struct ggml_expert_cache * expert_cache = nullptr;
 };
 
 void ggml_backend_sched_set_op_offload(ggml_backend_sched_t sched, enum ggml_op op, bool on_or_off) {
@@ -1248,6 +1265,11 @@ void ggml_backend_sched_set_op_offload(ggml_backend_sched_t sched, enum ggml_op 
 void ggml_backend_sched_set_only_active_experts(ggml_backend_sched_t sched, bool on_or_off) {
     if (!sched) return;
     sched->only_active_experts = on_or_off;
+}
+
+void ggml_backend_sched_set_expert_cache(ggml_backend_sched_t sched, struct ggml_expert_cache * cache) {
+    if (!sched) return;
+    sched->expert_cache = cache;
 }
 
 void ggml_backend_sched_set_split_mode_graph(ggml_backend_sched_t sched, bool on_or_off, bool async) {
@@ -1362,6 +1384,11 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
 
     // operations with weights are preferably run on the same backend as the weights
     bool offload_enabled = ggml_backend_sched_offload_enabled(sched, tensor->op);
+    // with an expert cache, MoE weights are deliberately kept host-side and staged
+    // into the cache arena on the compute backend; the backend's batch-size offload
+    // heuristic would keep 1-token decode on CPU, bypass it
+    bool xca_moe = sched->expert_cache != nullptr &&
+        (tensor->op == GGML_OP_MUL_MAT_ID || tensor->op == GGML_OP_MOE_FUSED_UP_GATE);
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         const struct ggml_tensor * src = tensor->src[i];
         if (src == NULL) {
@@ -1372,7 +1399,8 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
             // check if a backend with higher prio wants to offload the op
             if (offload_enabled && src_backend_id == sched->n_backends - 1) {
                 for (int b = 0; b < src_backend_id; b++) {
-                    if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
+                    if (ggml_backend_supports_op(sched->backends[b], tensor) &&
+                        (xca_moe || ggml_backend_offload_op(sched->backends[b], tensor))) {
                         SET_CAUSE(tensor, "1.off");
                         return b;
                     }
@@ -1842,6 +1870,25 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
                 const int src_backend_id = sched->hv_tensor_backend_ids[src_id];
                 assert(src_backend_id != -1); // all inputs should be assigned by now
 
+                if (getenv("IK_XCA_DEBUG") && src->buffer &&
+                    ggml_backend_buffer_get_usage(src->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                    ggml_backend_buffer_is_host(src->buffer) &&
+                    (node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_MOE_FUSED_UP_GATE)) {
+                    static uint64_t xca_wprobe_uid = 0;
+                    if (graph->uid != xca_wprobe_uid) {
+                        xca_wprobe_uid = graph->uid;
+                        const int xca_node_bid = tensor_backend_id(node);
+                        const bool xca_outer = src_backend_id != cur_backend_id &&
+                            !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id);
+                        const bool xca_copy_null = tensor_id_copy(src_id, cur_backend_id, 0) == NULL;
+                        fprintf(stderr,
+                            "xca-wprobe#%llu n_nodes=%d batch=%d node_bid=%d j=%d node=%s op=%s sbid=%d cur=%d outer=%d copy_null=%d\n",
+                            (unsigned long long)graph->uid, graph->n_nodes, node->ne[1], xca_node_bid,
+                            j, node->name, ggml_op_name(node->op),
+                            src_backend_id, cur_backend_id, (int)xca_outer, (int)xca_copy_null);
+                    }
+                }
+
                 if (src->flags & GGML_TENSOR_FLAG_INPUT && sched->n_copies > 1) {
                     if (tensor_id_copy(src_id, src_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[src_backend_id];
@@ -1895,6 +1942,22 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
                         GGML_ASSERT(n_inputs < GGML_SCHED_MAX_SPLIT_INPUTS);
                         split->inputs[n_inputs] = src;
                         }
+                    } else if (sched->expert_cache && sched->only_active_experts &&
+                            src->buffer != NULL &&
+                            ggml_backend_buffer_get_usage(src->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                            ggml_backend_buffer_is_host(src->buffer) &&
+                            (node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_MOE_FUSED_UP_GATE) &&
+                            (node->src[0] == src ||
+                             (node->op == GGML_OP_MOE_FUSED_UP_GATE && node->src[1] == src))) {
+                        /* The staged copy tensor persists across steps, so from the
+                         * second graph on tensor_id_copy is non-NULL and the weight
+                         * would never re-enter split->inputs — copy_inputs would not
+                         * run and the expert-cache arena would keep prefill's experts.
+                         * Re-list host expert weights every graph so the arena is
+                         * refreshed with this step's active experts. */
+                        int n_inputs = split->n_inputs++;
+                        GGML_ASSERT(n_inputs < GGML_SCHED_MAX_SPLIT_INPUTS);
+                        split->inputs[n_inputs] = src;
                     }
                     node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
                 }
@@ -2044,12 +2107,73 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
     ggml_backend_t split_backend = sched->backends[split_backend_id];
     ggml_backend_t last_input_backend = nullptr;
     bool synced_on_input = false;
+
+    static int64_t xca_ci_total_us = 0, xca_ci_ids_sync_us = 0, xca_ci_ids_cpu_us = 0;
+    static int64_t xca_ci_stage_us = 0, xca_ci_bytes = 0, xca_ci_calls = 0, xca_ci_dec_calls = 0;
+    static int64_t xca_ci_stage_runs = 0;
+    static int64_t xca_ci_head_us = 0, xca_ci_scan_us = 0, xca_ci_sync_calls = 0;
+    static int64_t xca_ci_input_flag_calls = 0, xca_ci_else_calls = 0;
+    static bool   xca_ci_atexit = false;
+    static const bool xca_ci_on = getenv("IK_XCA_TIMING") != nullptr;
+    if (xca_ci_on) {
+        if (!xca_ci_atexit) {
+            xca_ci_atexit = true;
+            atexit([]{
+                fprintf(stderr,
+                        "xca-copyin-stats calls=%lld dec_calls=%lld total_ms=%.2f ids_sync_ms=%.2f ids_cpu_ms=%.2f stage_ms=%.2f head_ms=%.2f scan_ms=%.2f stage_runs=%lld bytes=%.2fMB syncs=%lld inflag=%lld elseb=%lld\n",
+                        (long long) xca_ci_calls, (long long) xca_ci_dec_calls,
+                        xca_ci_total_us / 1e3, xca_ci_ids_sync_us / 1e3, xca_ci_ids_cpu_us / 1e3, xca_ci_stage_us / 1e3,
+                        xca_ci_head_us / 1e3, xca_ci_scan_us / 1e3,
+                        (long long) xca_ci_stage_runs, xca_ci_bytes / 1e6,
+                        (long long) xca_ci_sync_calls, (long long) xca_ci_input_flag_calls, (long long) xca_ci_else_calls);
+            });
+        }
+        xca_ci_calls++;
+        if (split->graph.n_nodes > 0 && split->graph.nodes[0]->ne[1] == 1) {
+            xca_ci_dec_calls++;
+        }
+    }
+    struct xca_ci_timer {
+        int64_t * target;
+        int64_t t0;
+        explicit xca_ci_timer(int64_t * t) : target(t), t0(ggml_time_us()) {}
+        ~xca_ci_timer() {
+            if (xca_ci_on) {
+                *target += ggml_time_us() - t0;
+            }
+        }
+    } xca_ci_total(&xca_ci_total_us);
     for (int j = 0; j < split->n_inputs; j++) {
+        int64_t t_head0 = ggml_time_us();
         ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[j]);
         struct ggml_tensor * input = split->inputs[j];
         struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
+        static int64_t xca_in_chk = 0, xca_in_hw = 0;
+        static bool xca_in_atexit = false;
+        if (getenv("IK_XCA_DEBUG") && sched->only_active_experts) {
+            if (!xca_in_atexit) {
+                xca_in_atexit = true;
+                atexit([]{
+                    fprintf(stderr, "xca-in-stats total_inputs=%lld host_weights=%lld\n",
+                            (long long)xca_in_chk, (long long)xca_in_hw);
+                });
+            }
+            xca_in_chk++;
+            if (ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                ggml_backend_buffer_is_host(input->buffer)) {
+                xca_in_hw++;
+                if (xca_in_hw <= 3 || (xca_in_hw % 200) == 0) {
+                    fprintf(stderr, "xca-in hw=%lld total=%lld name=%s n_inputs=%d nodes=%d tok=%d\n",
+                            (long long)xca_in_hw, (long long)xca_in_chk, input->name,
+                            split->n_inputs, split->graph.n_nodes,
+                            split->graph.n_nodes > 0 ? (int)split->graph.nodes[0]->ne[1] : -1);
+                }
+            }
+        }
+
         if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+            if (xca_ci_on) { xca_ci_input_flag_calls++; }
             // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
             // if there are multiple inputs for the split, and we have already synchronized this backend, no need to do it again.
             if (!synced_on_input) {
@@ -2057,6 +2181,7 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
+                    if (xca_ci_on) { xca_ci_sync_calls++; }
                 }
                 synced_on_input = true;
             }
@@ -2068,15 +2193,64 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
+                    if (xca_ci_on) { xca_ci_sync_calls++; }
                 }
                 needs_sync[split_backend_id] = k_set_sync;
             }
+            if (xca_ci_on) { xca_ci_head_us += ggml_time_us() - t_head0; }
+            int64_t t_scan0 = ggml_time_us();
 
-            ggml_tensor * node = split->graph.nodes[0];
+            /* Find the MoE op in this split that consumes this host weight.
+             * The old code assumed split->graph.nodes[0] was the MoE op, but in
+             * the fused up/gate path the split starts at ffn_norm and the MoE op
+             * is a later node, so streaming of only-active experts never engaged.
+             * Match on src[0] against either the original input or its staged copy
+             * (split_graph rewires node->src to the copy). */
+            ggml_tensor * node = nullptr;
             if (sched->only_active_experts && split->graph.n_nodes > 0 &&
                     ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
-                    ggml_backend_buffer_is_host(input->buffer) &&
-                    (node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_MOE_FUSED_UP_GATE)) {
+                    ggml_backend_buffer_is_host(input->buffer)) {
+                for (int t = 0; t < split->graph.n_nodes; ++t) {
+                    ggml_tensor * nd = split->graph.nodes[t];
+                    if (nd->op == GGML_OP_MUL_MAT_ID &&
+                        (nd->src[0] == input || nd->src[0] == input_cpy)) {
+                        node = nd;
+                        break;
+                    }
+                    if (nd->op == GGML_OP_MOE_FUSED_UP_GATE &&
+                        (nd->src[0] == input || nd->src[0] == input_cpy ||
+                         nd->src[1] == input || nd->src[1] == input_cpy)) {
+                        node = nd;
+                        break;
+                    }
+                }
+                if (xca_ci_on) { xca_ci_scan_us += ggml_time_us() - t_scan0; }
+                static int64_t xca_gate_n = 0;
+                static int64_t xca_g_chk = 0, xca_g_found = 0;
+                static int64_t xca_g_dec_chk = 0, xca_g_dec_found = 0;
+                static bool   xca_g_atexit = false;
+                if (getenv("IK_XCA_DEBUG")) {
+                    if (!xca_g_atexit) {
+                        xca_g_atexit = true;
+                        atexit([]{
+                            fprintf(stderr, "xca-gate-stats chk=%lld found=%lld dec_chk=%lld dec_found=%lld\n",
+                                    (long long)xca_g_chk, (long long)xca_g_found,
+                                    (long long)xca_g_dec_chk, (long long)xca_g_dec_found);
+                        });
+                    }
+                    xca_g_chk++;
+                    const bool is_dec = split->graph.n_nodes > 0 && split->graph.nodes[0]->ne[1] == 1;
+                    if (is_dec) { xca_g_dec_chk++; if (node) xca_g_dec_found++; }
+                    if (node) xca_g_found++;
+                    if (xca_gate_n < 4) {
+                        fprintf(stderr, "xca-gate#%lld name=%s nodes=%d nodefound=%d tokdim=%d\n",
+                                (long long)xca_gate_n, input->name, split->graph.n_nodes, node ? 1 : 0,
+                                split->graph.n_nodes > 0 ? (int)split->graph.nodes[0]->ne[1] : -1);
+                        xca_gate_n++;
+                    }
+                }
+            }
+            if (node) {
 
                 if (input_backend != last_input_backend) {
                     ggml_backend_synchronize(input_backend);
@@ -2098,17 +2272,54 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
 
                 int n_expert = node->src[0]->ne[2];
 
+                /* Phase A: ExpertCache integration (Strata R4.2g, Fate 2502.12224).
+                 * If a cache is attached, check each active expert for residency
+                 * before copying. Cached experts skip the VRAM transfer entirely.
+                 */
+                struct ggml_expert_cache * xcache = sched->expert_cache;
+                int64_t cache_layer = -1;
+                /* Parse the layer index from the ORIGINAL weight name ("blk.N." /
+                 * "layers.N."). NOTE: node->src[0] is the staged copy at compute
+                 * time and is named "ROCm0#blk.N...#0", so we must use input->name
+                 * (the original host weight) and scan for the token, not assume a
+                 * prefix. Getting this wrong left cache_layer=-1 and disabled the
+                 * whole cache (observed: xca queries=0). */
+                const char * tname = input->name;
+                if (xcache && tname) {
+                    const char * b = strstr(tname, "blk.");
+                    const char * l = strstr(tname, "layers.");
+                    if (l) {
+                        cache_layer = strtoll(l + 7, NULL, 10);
+                    } else if (b) {
+                        cache_layer = strtoll(b + 4, NULL, 10);
+                    }
+                }
+
                 if (ids_tensor != last_ids_tensor) {
+                    int64_t t_ids0 = ggml_time_us();
                     ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
 
                     ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
 
-                    ggml_backend_synchronize(ids_backend);
+                    /* Event-scoped wait: the ids D2H is the last op we enqueued, so an
+                     * event recorded right after it bounds the wait to that copy and to
+                     * whatever the stream legitimately had to finish first (routing
+                     * kernels). A full ggml_backend_synchronize also drains anything a
+                     * later staging enqueue added, which stalls the host per layer. */
+                    ggml_backend_event_t xca_ids_ev = xca_ids_event_for(ids_backend);
+                    if (xca_ids_ev) {
+                        ggml_backend_event_record(xca_ids_ev);
+                        ggml_backend_event_synchronize(xca_ids_ev);
+                    } else {
+                        ggml_backend_synchronize(ids_backend);
+                    }
+                    if (xca_ci_on) { xca_ci_ids_sync_us += ggml_time_us() - t_ids0; }
                     if (auto id = tensor_backend_id(ids_tensor); id >= 0 && id < GGML_SCHED_MAX_BACKENDS) {
                         needs_sync[id] = k_set_sync;
                     }
                     //needs_sync[tensor_backend_id(ids_tensor)] = k_set_sync;
 
+                    int64_t t_cpu0 = ggml_time_us();
                     unique_ids.resize((n_expert + 31)/32);
                     std::memset(unique_ids.data(), 0, unique_ids.size()*sizeof(uint32_t));
                     for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
@@ -2119,6 +2330,7 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                     }
 
                     last_ids_tensor = ids_tensor;
+                    if (xca_ci_on) { xca_ci_ids_cpu_us += ggml_time_us() - t_cpu0; }
                 }
 
                 // when the expert prefetch engine streamed this tensor ahead
@@ -2128,48 +2340,156 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
 
                 const size_t expert_size = input->ne[2] > 1 ? input->nb[2] : input->nb[1];
 
+                xca_ci_timer xca_ci_stage(&xca_ci_stage_us);
+
                 if (input->ne[2] > 1) {
 
-                    auto copy_experts = [&](int32_t first_id, int32_t last_id) {
-                        const size_t expert_offset = first_id * expert_size;
-                        const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
-                        const size_t padding = 512;
-                        const size_t padding_end = last_id < n_expert - 1 ? std::min<size_t>(expert_size, padding) : 0;
+                    /* Persistent-arena expert copy.
+                     * If this layer is covered by the VRAM expert cache, the MoE
+                     * kernel reads experts directly from the cache's own arena: we
+                     * point input_cpy->data (== node->src[0]->data) at the arena and
+                     * upload only experts not already resident. The arena is dedicated
+                     * and persistent, so a "resident" expert is genuinely valid across
+                     * steps (unlike the scheduler's aliased staging buffer, which caused
+                     * NaN logits when we tried to skip copies there). Otherwise fall
+                     * back to the original contiguous staging copy. */
+                    int cache_kind = -1;
+                    if (xcache && cache_layer >= 0 &&
+                            ggml_expert_cache_layer_cached(xcache, cache_layer)) {
+                        const char * nm = input->name;
+                        if      (nm && strstr(nm, "ffn_up_exps"))   cache_kind = GGML_EXPERT_KIND_UP;
+                        else if (nm && strstr(nm, "ffn_gate_exps")) cache_kind = GGML_EXPERT_KIND_GATE;
+                        else if (nm && strstr(nm, "ffn_down_exps")) cache_kind = GGML_EXPERT_KIND_DOWN;
+                    }
 
-                        ggml_backend_tensor_set_async(split_backend,
-                                input_cpy,
-                                (const uint8_t *)input->data + expert_offset, expert_offset,
-                                // copy a bit extra to ensure there are no NaNs in the padding
-                                expert_size_copy + padding_end);
+                    void * cache_arena = cache_kind >= 0
+                        ? ggml_expert_cache_kind_base(xcache, cache_layer, cache_kind) : nullptr;
+                    const int64_t cache_stride = cache_kind >= 0
+                        ? ggml_expert_cache_kind_stride(xcache, cache_layer, cache_kind) : 0;
+                    if (cache_arena == nullptr || cache_stride <= 0) cache_kind = -1;
 
-                    };
+                    if (getenv("IK_XCA_DEBUG") && xcache) {
+                        static int64_t xca_skip_n = 0;
+                        if (xca_skip_n < 20) {
+                            fprintf(stderr, "xca-dbg skip#%lld layer=%lld kind=%d arena=%p stride=%lld name=%s\n",
+                                    (long long)xca_skip_n, (long long)cache_layer, cache_kind,
+                                    cache_arena, (long long)cache_stride, input->name);
+                            xca_skip_n++;
+                        }
+                    }
 
-                    auto next_on_id = [&unique_ids, n_expert] (int id) {
-                        while (id < n_expert && (unique_ids[id >> 5] & (1u << (id & 31))) == 0) ++id;
-                        return id;
-                    };
-                    auto next_off_id = [&unique_ids, n_expert] (int id) {
-                        while (id < n_expert && (unique_ids[id >> 5] & (1u << (id & 31))) != 0) ++id;
-                        return id;
-                    };
+                    if (cache_kind >= 0) {
+                        const void *  arena  = cache_arena;
+                        const int64_t stride = cache_stride;
+                        /* Redirect the kernel's read pointer to the arena. */
+                        input_cpy->data = const_cast<void *>(arena);
 
-                    int first_id = next_on_id(0);
-                    while (first_id < n_expert) {
-                        int last_id = next_off_id(first_id+1);
-                        copy_experts(first_id, last_id-1);
-                        first_id = next_on_id(last_id);
+                        static int64_t xca_dbg_n = 0;
+                        if (getenv("IK_XCA_DEBUG") && xca_dbg_n < 60) {
+                            int active = 0, resident = 0;
+                            for (int e = 0; e < n_expert; ++e) {
+                                if (unique_ids[e >> 5] & (1u << (e & 31))) {
+                                    active++;
+                                    if (ggml_expert_cache_resident(xcache, cache_layer, cache_kind, e)) resident++;
+                                }
+                            }
+                            fprintf(stderr, "xca-dbg inv=%lld layer=%lld kind=%d active=%d resident_before=%d hits=%llu misses=%llu\n",
+                                    (long long)xca_dbg_n, (long long)cache_layer, cache_kind,
+                                    active, resident,
+                                    (unsigned long long)xcache->hits,
+                                    (unsigned long long)xcache->misses);
+                            xca_dbg_n++;
+                        }
+
+                        auto next_on_id = [&unique_ids, n_expert] (int id) {
+                            while (id < n_expert && (unique_ids[id >> 5] & (1u << (id & 31))) == 0) ++id;
+                            return id;
+                        };
+                        auto next_off_id = [&unique_ids, n_expert] (int id) {
+                            while (id < n_expert && (unique_ids[id >> 5] & (1u << (id & 31))) != 0) ++id;
+                            return id;
+                        };
+                        auto is_res = [&](int id) {
+                            return ggml_expert_cache_resident(xcache, cache_layer, cache_kind, id) != 0;
+                        };
+
+                        int first_id = next_on_id(0);
+                        while (first_id < n_expert) {
+                            const int last_id = next_off_id(first_id + 1) - 1;
+                            int run_start = first_id;
+                            bool run_res = is_res(first_id);
+                            for (int id = first_id + 1; id <= last_id + 1; ++id) {
+                                const bool res = (id <= last_id) && is_res(id);
+                                if (id > last_id || res != run_res) {
+                                    const int run_end = (id <= last_id) ? id - 1 : last_id;
+                                    if (!run_res) {
+                                        const size_t off = (size_t)run_start * stride;
+                                        const size_t bytes = (size_t)(run_end - run_start + 1) * stride;
+                                        ggml_backend_tensor_set_async(split_backend, input_cpy,
+                                            (const uint8_t *)input->data + off, off, bytes);
+                                        if (xca_ci_on) { xca_ci_bytes += (int64_t) bytes; xca_ci_stage_runs++; }
+                                        for (int k = run_start; k <= run_end; ++k) {
+                                            ggml_expert_cache_mark(xcache, cache_layer, cache_kind, k);
+                                            ggml_expert_cache_note_miss(xcache);
+                                        }
+                                    } else {
+                                        for (int k = run_start; k <= run_end; ++k) {
+                                            ggml_expert_cache_note_hit(xcache);
+                                        }
+                                    }
+                                    run_start = id;
+                                    run_res = res;
+                                }
+                            }
+                            first_id = next_on_id(last_id + 1);
+                        }
+                    } else {
+                        /* No cache — original contiguous-range copy path */
+                        auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+                            const size_t expert_offset = first_id * expert_size;
+                            const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
+                            const size_t padding = 512;
+                            const size_t padding_end = last_id < n_expert - 1 ? std::min<size_t>(expert_size, padding) : 0;
+
+                            ggml_backend_tensor_set_async(split_backend,
+                                    input_cpy,
+                                    (const uint8_t *)input->data + expert_offset, expert_offset,
+                                    // copy a bit extra to ensure there are no NaNs in the padding
+                                    expert_size_copy + padding_end);
+                            if (xca_ci_on) { xca_ci_bytes += (int64_t)(expert_size_copy + padding_end); xca_ci_stage_runs++; }
+
+                        };
+
+                        auto next_on_id = [&unique_ids, n_expert] (int id) {
+                            while (id < n_expert && (unique_ids[id >> 5] & (1u << (id & 31))) == 0) ++id;
+                            return id;
+                        };
+                        auto next_off_id = [&unique_ids, n_expert] (int id) {
+                            while (id < n_expert && (unique_ids[id >> 5] & (1u << (id & 31))) != 0) ++id;
+                            return id;
+                        };
+
+                        int first_id = next_on_id(0);
+                        while (first_id < n_expert) {
+                            int last_id = next_off_id(first_id+1);
+                            copy_experts(first_id, last_id-1);
+                            first_id = next_on_id(last_id);
+                        }
                     }
 
                 } else {
                     auto copy_size = ggml_nbytes(input);
                     ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, copy_size);
+                    if (xca_ci_on) { xca_ci_bytes += (int64_t) copy_size; xca_ci_stage_runs++; }
                 }
 
-            } else
+            } else {
+                if (xca_ci_on) { xca_ci_else_calls++; }
                 // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                 // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                 if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
                     ggml_backend_synchronize(input_backend);
+                    if (xca_ci_on) { xca_ci_sync_calls++; }
                     if (needs_sync[split_backend_id]) {
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
@@ -2180,6 +2500,7 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                     }
                     ggml_backend_tensor_copy(input, input_cpy);
                 }
+            }
         }
     }
 }
@@ -2418,7 +2739,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 // record the event of this copy
                 if (split->n_inputs > 0) {
                     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                        printf("Recording event %d, %d\n", split_backend_id, sched->cur_copy);
                         ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy]);
                     }
                 }
@@ -2616,10 +2936,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
         sched->backends[b] = backends[b];
         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
         GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
-        if (sched->n_copies > 1) {
-            for (int c = 0; c < sched->n_copies; c++) {
-                sched->events[b][c] = ggml_backend_event_new(backends[b]);
-            }
+        // events are also used with a single copy: the MoE expert-staging path in
+        // ggml_backend_sched_copy_inputs relies on stream-ordered event waits to avoid
+        // a full ggml_backend_synchronize per staged weight input
+        for (int c = 0; c < sched->n_copies; c++) {
+            sched->events[b][c] = ggml_backend_event_new(sched->backends[b]);
         }
     }
 
@@ -2634,9 +2955,111 @@ ggml_backend_sched_t ggml_backend_sched_new(
     return sched;
 }
 
+struct ggml_perf_agg {
+    uint64_t ops  = 0;
+    double   dev  = 0;
+    double   idle = 0;
+    double   host = 0;
+};
+
+static bool                            g_perf_on      = false;
+static double                          g_perf_wall_us = 0;
+static std::map<std::string, ggml_perf_agg> g_perf_comps;
+static std::map<std::string, double>   g_perf_phases;
+static std::mutex                      g_perf_mtx;
+
+void ggml_perf_trace_set(int enable) {
+    std::lock_guard<std::mutex> lock(g_perf_mtx);
+    g_perf_on = enable != 0;
+}
+
+int ggml_perf_trace_enabled(void) {
+    std::lock_guard<std::mutex> lock(g_perf_mtx);
+    return g_perf_on ? 1 : 0;
+}
+
+void ggml_perf_trace_add(const char * component, double dev_us, double idle_us, double host_us) {
+    std::lock_guard<std::mutex> lock(g_perf_mtx);
+    if (!g_perf_on) {
+        return;
+    }
+    ggml_perf_agg & a = g_perf_comps[component ? component : "other"];
+    a.ops += 1;
+    a.dev += dev_us > 0 ? dev_us : 0;
+    a.idle += idle_us > 0 ? idle_us : 0;
+    a.host += host_us;
+}
+
+void ggml_perf_trace_add_wall(double wall_us) {
+    std::lock_guard<std::mutex> lock(g_perf_mtx);
+    if (!g_perf_on) {
+        return;
+    }
+    g_perf_wall_us += wall_us;
+}
+
+void ggml_perf_trace_phase(const char * name, double us) {
+    std::lock_guard<std::mutex> lock(g_perf_mtx);
+    if (!g_perf_on || !name) {
+        return;
+    }
+    g_perf_phases[name] += us;
+}
+
+void ggml_perf_trace_flush(void) {
+    std::lock_guard<std::mutex> lock(g_perf_mtx);
+    if (g_perf_comps.empty()) {
+        return;
+    }
+
+    std::vector<std::pair<std::string, ggml_perf_agg>> rows(g_perf_comps.begin(), g_perf_comps.end());
+    std::sort(rows.begin(), rows.end(), [](const std::pair<std::string, ggml_perf_agg> & a, const std::pair<std::string, ggml_perf_agg> & b) {
+        return a.second.dev > b.second.dev;
+    });
+
+    double   dev_tot  = 0;
+    double   idle_tot = 0;
+    double   host_tot = 0;
+    uint64_t ops_tot  = 0;
+    for (const auto & r : rows) {
+        dev_tot  += r.second.dev;
+        idle_tot += r.second.idle;
+        host_tot += r.second.host;
+        ops_tot  += r.second.ops;
+    }
+    const double wall = g_perf_wall_us > 0 ? g_perf_wall_us : (dev_tot + idle_tot);
+
+    fprintf(stderr, "\n[perfprofile] component         ops      %%dev     dev_ms    idle_ms    host_ms\n");
+    for (const auto & r : rows) {
+        const ggml_perf_agg & a = r.second;
+        fprintf(stderr, "[perfprofile] %-14s %8llu %8.1f%% %10.2f %10.2f %10.2f\n",
+                r.first.c_str(), (unsigned long long) a.ops, wall > 0 ? 100.0 * a.dev / wall : 0.0,
+                a.dev / 1e3, a.idle / 1e3, a.host / 1e3);
+    }
+    fprintf(stderr, "[perfprofile] %-14s %8llu %8.1f%% %10.2f %10.2f %10.2f   wall_ms=%.2f\n",
+            "TOTAL", (unsigned long long) ops_tot, wall > 0 ? 100.0 * dev_tot / wall : 0.0,
+            dev_tot / 1e3, idle_tot / 1e3, host_tot / 1e3, wall / 1e3);
+
+    if (!g_perf_phases.empty()) {
+        fprintf(stderr, "[perfprofile] phases");
+        for (const auto & p : g_perf_phases) {
+            fprintf(stderr, " %s=%.2fms", p.first.c_str(), p.second / 1e3);
+        }
+        fprintf(stderr, " sum=%.2fms\n", [&] { double s = 0; for (const auto & p : g_perf_phases) { s += p.second; } return s; }() / 1e3);
+    }
+
+    g_perf_comps.clear();
+    g_perf_phases.clear();
+    g_perf_wall_us = 0;
+}
+
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
+    }
+    ggml_perf_trace_flush();
+    if (sched->expert_cache) {
+        ggml_expert_cache_dump((const ggml_expert_cache_t *)sched->expert_cache);
     }
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
@@ -2792,8 +3215,26 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
 }
 
 enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    static const bool xca_sched_on = getenv("IK_XCA_TIMING") != nullptr;
+    static int64_t xca_sched_total_us = 0, xca_sched_calls = 0;
+    static bool   xca_sched_atexit = false;
+    if (xca_sched_on) {
+        if (!xca_sched_atexit) {
+            xca_sched_atexit = true;
+            atexit([]{
+                fprintf(stderr, "xca-sched-stats calls=%lld total_ms=%.2f avg_ms=%.3f\n",
+                        (long long) xca_sched_calls, xca_sched_total_us / 1e3,
+                        xca_sched_calls ? xca_sched_total_us / 1e3 / xca_sched_calls : 0.0);
+            });
+        }
+    }
+    const int64_t t_sched0 = ggml_time_us();
     enum ggml_status err = ggml_backend_sched_graph_compute_async(sched, graph);
     ggml_backend_sched_synchronize(sched);
+    if (xca_sched_on) {
+        xca_sched_total_us += ggml_time_us() - t_sched0;
+        xca_sched_calls++;
+    }
     return err;
 }
 
